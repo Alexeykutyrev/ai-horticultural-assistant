@@ -6,24 +6,29 @@ import base64
 import numpy as np
 import cv2
 import logging
+import requests
 import tempfile
 import math
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, FileResponse
 import uvicorn
 from ultralytics import YOLO
+import time
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# ================== КОНФИГУРАЦИЯ МОДЕЛЕЙ ==================
 TASK_MODEL_BASENAME = {
     "detection": "yolo26n.pt",
     "instance_seg": "yolo26n-seg.pt",
     "semantic_seg": "yolo26n-seg.pt",
     "classification": "yolo26n-cls.pt",
-    "keypoint": "yolo26n-pose.pt"
+    "keypoint": "yolo26n-pose.pt",
+    "multimodal": "yolo26n.pt"
 }
 
 OBJECTS = [
@@ -104,48 +109,56 @@ async def analyze_plant(
     max_det: int = Form(300),
     device: str = Form("cpu")
 ):
-    model = get_yolo_model(task, object, device)
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        return {"error": "Не удалось декодировать изображение"}
+    try:
+        model = get_yolo_model(task, object, device)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Ошибка загрузки модели: {str(e)}"})
 
-    results = model(img, conf=conf, iou=iou, max_det=max_det)[0]
-    annotated = results.plot()
+    try:
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return JSONResponse(status_code=400, content={"error": "Не удалось декодировать изображение"})
 
-    if task == "keypoint" and results.keypoints is not None:
-        kpts_data = results.keypoints.data.cpu().numpy()
-        for obj_kpts in kpts_data:
-            draw_skeleton(annotated, obj_kpts, TREE_SKELETON)
+        results = model(img, conf=conf, iou=iou, max_det=max_det)[0]
+        annotated = results.plot()
 
-    _, buffer = cv2.imencode('.jpg', annotated)
-    img_base64 = base64.b64encode(buffer).decode('utf-8')
+        if task == "keypoint" and results.keypoints is not None:
+            kpts_data = results.keypoints.data.cpu().numpy()
+            for obj_kpts in kpts_data:
+                draw_skeleton(annotated, obj_kpts, TREE_SKELETON)
 
-    detections = []
-    counts = {}
-    if results.boxes is not None:
-        for i, box in enumerate(results.boxes):
-            cls_id = int(box.cls[0])
-            cls_name = results.names[cls_id]
-            conf_val = float(box.conf[0])
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            det = {"class": cls_name, "confidence": conf_val, "bbox": [int(x1), int(y1), int(x2), int(y2)]}
-            if results.masks is not None and i < len(results.masks.data):
-                mask = results.masks.data[i].cpu().numpy()
-                det["area"] = int(np.sum(mask))
-            if results.keypoints is not None and i < len(results.keypoints.data):
-                det["keypoints"] = results.keypoints.data[i].cpu().numpy().tolist()
-            detections.append(det)
-            counts[cls_name] = counts.get(cls_name, 0) + 1
+        _, buffer = cv2.imencode('.jpg', annotated)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
 
-    return {
-        "image_base64": img_base64,
-        "detections": detections,
-        "counts": counts,
-        "image_width": img.shape[1],
-        "image_height": img.shape[0]
-    }
+        detections = []
+        counts = {}
+        if results.boxes is not None:
+            for i, box in enumerate(results.boxes):
+                cls_id = int(box.cls[0])
+                cls_name = results.names[cls_id]
+                conf_val = float(box.conf[0])
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                det = {"class": cls_name, "confidence": conf_val, "bbox": [int(x1), int(y1), int(x2), int(y2)]}
+                if results.masks is not None and i < len(results.masks.data):
+                    mask = results.masks.data[i].cpu().numpy()
+                    det["area"] = int(np.sum(mask))
+                if results.keypoints is not None and i < len(results.keypoints.data):
+                    det["keypoints"] = results.keypoints.data[i].cpu().numpy().tolist()
+                detections.append(det)
+                counts[cls_name] = counts.get(cls_name, 0) + 1
+
+        return {
+            "image_base64": img_base64,
+            "detections": detections,
+            "counts": counts,
+            "image_width": img.shape[1],
+            "image_height": img.shape[0]
+        }
+    except Exception as e:
+        logger.error(f"Ошибка: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/api/upload_model")
 async def upload_model(file: UploadFile = File(...), user_id: str = Form(...)):
@@ -186,7 +199,7 @@ async def test_model(
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
-        return {"error": "Не удалось декодировать изображение"}
+        return JSONResponse(status_code=400, content={"error": "Не удалось декодировать изображение"})
     results = model(img, conf=conf, iou=iou, max_det=max_det)[0]
     annotated = results.plot()
     _, buffer = cv2.imencode('.jpg', annotated)
@@ -210,9 +223,79 @@ async def test_model(
         "image_height": img.shape[0]
     }
 
+@app.get("/api/model_info")
+async def model_info(user_id: str, model_name: str):
+    preset_path = os.path.join("models", model_name)
+    if os.path.isfile(preset_path):
+        stat = os.stat(preset_path)
+        size = stat.st_size
+        mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        return {
+            "type": "preset",
+            "name": model_name,
+            "size": size,
+            "modified": mtime,
+            "classes": "unknown",
+            "map": "unknown",
+            "date": "unknown"
+        }
+    user_dir = os.path.join(USER_MODELS_DIR, str(user_id))
+    file_path = os.path.join(user_dir, model_name)
+    if not os.path.isfile(file_path):
+        raise HTTPException(404, "Модель не найдена")
+    stat = os.stat(file_path)
+    size = stat.st_size
+    mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
+    return {"type": "user", "name": model_name, "size": size, "modified": mtime}
+
+@app.delete("/api/delete_model")
+async def delete_model(user_id: str, model_name: str):
+    user_dir = os.path.join(USER_MODELS_DIR, str(user_id))
+    file_path = os.path.join(user_dir, model_name)
+    if not os.path.isfile(file_path):
+        raise HTTPException(404, "Модель не найдена")
+    os.remove(file_path)
+    return {"status": "ok"}
+
+UPDATE_MODELS_URL = os.getenv("UPDATE_MODELS_URL", "https://example.com/models/{filename}")
+
+@app.post("/api/admin/update_models")
+async def update_models():
+    updated = []
+    failed = []
+    for filename in os.listdir("models"):
+        if filename.endswith(".pt"):
+            url = UPDATE_MODELS_URL.format(filename=filename)
+            try:
+                resp = requests.get(url, timeout=30)
+                if resp.status_code == 200:
+                    local_path = os.path.join("models", filename)
+                    with open(local_path, "wb") as f:
+                        f.write(resp.content)
+                    updated.append(filename)
+                    keys_to_delete = [k for k in loaded_models if k.startswith(filename.replace('.pt',''))]
+                    for k in keys_to_delete:
+                        del loaded_models[k]
+                    logger.info(f"Модель обновлена: {filename}")
+                else:
+                    failed.append(filename)
+            except Exception as e:
+                logger.error(f"Ошибка обновления {filename}: {e}")
+                failed.append(filename)
+    return {"updated": updated, "failed": failed}
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=9000)
+    missing = []
+    for key, path in MODEL_PATHS.items():
+        if not os.path.exists(path):
+            missing.append(path)
+    if missing:
+        logger.warning("Некоторые файлы моделей отсутствуют. Для работы бота загрузите их в папку models/")
+    else:
+        logger.info("Все модели найдены.")
+    port = 9000
+    uvicorn.run(app, host="127.0.0.1", port=port, timeout_keep_alive=120, timeout_graceful_shutdown=120)
