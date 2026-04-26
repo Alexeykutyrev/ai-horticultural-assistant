@@ -22,13 +22,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ================== Загрузка моделей ==================
 TASK_MODEL_BASENAME = {
-    "detection": "yolo26n.pt",
-    "instance_seg": "yolo26n-seg.pt",
-    "semantic_seg": "yolo26n-seg.pt",
-    "classification": "yolo26n-cls.pt",
-    "keypoint": "yolo26n-pose.pt",
-    "multimodal": "yolo26n.pt"
+    "detection": "yolo.pt",
+    "instance_seg": "yolo-seg.pt",
+    "semantic_seg": "yolo-seg.pt",
+    "classification": "yolo-cls.pt",
+    "keypoint": "yolo-pose.pt",
+    "multimodal": "yolo.pt"
 }
 
 OBJECTS = [
